@@ -1,19 +1,19 @@
 # -*- coding: utf-8 -*-
 
+import csv
 import datetime
+import importlib
+import logging
 import os
 import re
 from copy import copy
 from time import sleep
 
 import ccxt.base.errors
-import tqdm
-
-import csv
-import logging
-import importlib
 import click
+import tqdm
 from currencies import MONEY_FORMATS
+from methodtools import lru_cache
 
 logging.basicConfig(format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s', datefmt='%H:%M:%S',
                     level=logging.ERROR)
@@ -65,6 +65,106 @@ def main(output_file_name, date_from, date_to, exch_config, filter_fiats):
                                 [trade[item] for item in ['datetime', 'symbol', 'cost', 'amount', 'side']])
 
     print('\nDone, see {}'.format(output_file_name))
+
+
+class pricefetchingcache:
+    def __init__(self):
+        self.exchange = ccxt.binance()
+
+    @lru_cache(max_size=500)
+    def _get_taxprice(self, symbol, minutes):
+        return self.exchange.fetch_ohlcv(symbol, '1m', t, 1)[1]
+        """
+                Which will return candlestick values for one candle
+        [ 
+          1516792860000, // timestamp
+          11110, // value at beginning of minute, so the value at exactly "2018-01-24 11:20:00"
+          11110.29, // highest value between "2018-01-24 11:20:00" and "2018-01-24 11:20:59"
+          11050.91, // lowest value between "2018-01-24 11:20:00" and "2018-01-24 11:20:59"
+          11052.27, // value just before "2018-01-24 11:21:00"
+          39.882601 // The volume traded during this minute
+        ]
+        """
+
+    def get_taxprice(self, symbol, timestamp, known={}):
+        t = int(timestamp * 1000)
+        splits = symbol.split("/")
+        if splits[0] == splits[1]:
+            return 1
+
+        if symbol in known:
+            return known[symbol]
+
+        return self._get_taxprice(symbol, t)
+
+
+def ccxt_fmt_to_accounting_fmt(exchange_name, item, pricefetching=pricefetchingcache()):
+    if item['type'] == "buy":
+        firstsign = +1
+        secondsign = -1
+    else:
+        firstsign = -1
+        secondsign = -1
+
+    changes = list(item['symbol'].split("/")) + item['fee']['currency']
+    amounts = [firstsign * item['amount'], secondsign * item['cost'], -item['fee']['cost']]
+
+    # now add prices:
+    # curr1/USDT price, curr2/USDT price, curr3/USDT price, EUR/USDT price
+    pricesproxy_info = "USDT-EUR"  # proxy-final
+    feeproxyinfo = "USDT-EUR"  # proxy-final
+    prices = [1,  # first commodity to proxy (pricesinfo)
+              1,  # second commodity to proxy (pricesinfo)
+              1,  # fee to proxy (usdt)
+              1,  # EUR/USDT (final/proxy)
+              ]
+
+    if changes[1] == "EUR":  # we do not need proxy, we traded directly with eur
+        pricesproxy_info = "EUR-EUR"
+        prices[0] = item["price"]
+        prices[1] = 1
+    else:
+        prices[0] = pricefetching.get_taxprice(changes[0] + '/USDT', item['timestamp'], {item['symbol']: item["price"]})
+        prices[1] = pricefetching.get_taxprice(changes[1] + '/USDT', item['timestamp'], {item['symbol']: item["price"]})
+
+    # now fee value
+    if changes[2] == "EUR":  # fee was paid in euro, no proxy needed
+        feeproxyinfo = "EUR-EUR"
+        prices[2] = 1
+        prices[3] = 1
+    else:  # we go through proxy
+        prices[2] = pricefetching.get_taxprice(changes[2] + '/USDT', item['timestamp'], {item['symbol']: item["price"]})
+        prices[3] = 1.0 / pricefetching.get_taxprice('EUR/USDT', item['timestamp'], {item['symbol']: item["price"]})
+        # if that would be usdt/eur we do not need to do 1.0/
+
+    return (exchange_name, item['datetime'],
+            changes[0], amounts[0],  # we did this change in this currency of this amount
+            changes[1], amounts[1],  # we did this change in this currency of this amount
+            changes[2], amounts[2],  # we did this change in this currency of this amount (this was the fee)
+            pricesproxy_info,  # FOr taxing, we use proxy-final (or there can be written final-final without proxy)
+            prices[0], prices[1],  # these are the prices (open) of the first and second currency
+            feeproxyinfo,  # For taxing the fee , we use proxy-final (or there can be written final-final without proxy)
+            prices[2], prices[3]  # price for fee/proxy, price proxy/final (usually usdt/eur)
+            )
+
+
+ACCOUNTINGFMT = ("exchange", "datetime",
+                 "CurrA", "ChngA",
+                 "CurrB", "ChngB",
+                 "CurrFee", "ChngFee",
+                 "TaxProxy",
+                 "PriceA", "PriceB",
+                 "FeeProxy",
+                 "PriceFee", "proxy/final"
+                 )
+
+
+def taxing_price_info(item, proxy="USDT", curr="EUR", curr_symbol="EUR/USDT"):
+    # curr1/USDT price, curr2/USDT price, curr3/USDT price, EUR/USDT price
+    prices = []
+
+    traded = list(item['symbol'].split("/"))
+    if traded[1] == "USDT":
 
 
 @click.command(name="continuousdl")
@@ -128,11 +228,11 @@ def continuousdl(output_file_dir, min_date_from, date_to, exch_config):
     file_to_produce = os.path.join(output_file_dir, fname_def + date_last_valid_yesterday + fname_end)
     print(f"producing to {file_to_produce}")
 
+    pricefetching = pricefetchingcache()
 
-    header = ['exchange', 'datetime', 'symbol', 'cost', 'amount', 'side']
     with open(file_to_produce, 'w', encoding='UTF8', newline='') as f:
         writer = csv.writer(f, delimiter=';')
-        writer.writerow(header)
+        writer.writerow(ACCOUNTINGFMT)
 
         for exchange in exchanges:
             print()
@@ -140,27 +240,25 @@ def continuousdl(output_file_dir, min_date_from, date_to, exch_config):
             all_my_trades = get_exch_trades(date_from, date_to, exchange)
 
             for trade in all_my_trades:
-                writer.writerow([exchange.name] +
-                                [trade[item] for item in ['datetime', 'symbol', 'cost', 'amount', 'side']])
+                writer.writerow(ccxt_fmt_to_accounting_fmt(exchange.name, trade, pricefetching)
 
-    print('\nDone, see {}'.format(file_to_produce))
+                print('\nDone, see {}'.format(file_to_produce))
 
-# TODO: merge vsech techto,
-# Stvoreni dane metodou FIFO
-# todo - vcetne daneni v okamziku smeny za jinou kryptomenu, takze je potreba znat cenu v okamziku obchodu
-# (asi prez btc cenu? nebo jakoukoliv jinou)
-# kdyz se nenajde v ucetni knize, brat jako ze vznikla odjinud a danit bez nakupni ceny.
-# https://stackoverflow.com/questions/70318352/how-to-get-the-price-of-a-crypto-at-a-given-time-in-the-past
-
+                # TODO: merge vsech techto,
+                # Stvoreni dane metodou FIFO
+                # todo - vcetne daneni v okamziku smeny za jinou kryptomenu, takze je potreba znat cenu v okamziku obchodu
+                # (asi prez btc cenu? nebo jakoukoliv jinou)
+                # kdyz se nenajde v ucetni knize, brat jako ze vznikla odjinud a danit bez nakupni ceny.
+                # https://stackoverflow.com/questions/70318352/how-to-get-the-price-of-a-crypto-at-a-given-time-in-the-past
 
 
-def get_exch_trades(date_from, date_to, exchange, filter_currencies):
+def get_exch_trades(date_from, date_to, exchange, add_ref_price="EUR", filter_currencies=None):
     filter_currencies = set(filter_currencies) if filter_currencies else None
     if exchange.name.find('Coinbase') >= 0 or exchange.name.find('Binance') >= 0 or exchange.name.find('Huobi') >= 0:
         markets = exchange.load_markets()
 
         if exchange.name.find('Binance') >= 0:
-            markets = [m for m in markets if m.find(":")<0]
+            markets = [m for m in markets if m.find(":") < 0]
 
         if filter_currencies:
             symbols = [symbol for symbol in markets if not set(symbol.split("/")).isdisjoint(filter_currencies)]
@@ -169,10 +267,10 @@ def get_exch_trades(date_from, date_to, exchange, filter_currencies):
     else:
         symbols = [None]
 
-    #exchange.verbose = True
+    # exchange.verbose = True
 
-    #date_from_ = int(date_from.timestamp()) * 1000 if date_from else None
-    #date_to_ = int(date_to.timestamp() + 24 * 60 * 60) * 1000
+    # date_from_ = int(date_from.timestamp()) * 1000 if date_from else None
+    # date_to_ = int(date_to.timestamp() + 24 * 60 * 60) * 1000
     date_from_ = exchange.parse8601(date_from.isoformat())
     date_to_ = exchange.parse8601(date_to.isoformat())
 
@@ -183,8 +281,8 @@ def get_exch_trades(date_from, date_to, exchange, filter_currencies):
         sleep(0.1)
         while True:
             my_trades = exchange.fetch_my_trades(symbol=symbol, since=date_from_,
-                                                params=params)
-            #except ccxt.DDoSProtection:
+                                                 params=params)
+            # except ccxt.DDoSProtection:
             #    sleep(1)
             #    exchange.checkRequiredCredentials()
             #    continue
