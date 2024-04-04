@@ -165,6 +165,8 @@ ACCOUNTINGFMT = ("exchange", "datetime",
 class PythonLiteralOption(click.Option):
 
     def type_cast_value(self, ctx, value):
+        if value is None:
+            return None
         try:
             return ast.literal_eval(value)
         except:

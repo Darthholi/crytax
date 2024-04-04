@@ -1,2 +1,5 @@
-ccxt==1.59.72
+ccxt
 methodtools
+click
+tqdm
+currencies
