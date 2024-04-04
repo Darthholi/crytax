@@ -6,6 +6,7 @@ import importlib
 import logging
 import os
 import re
+import ast
 from copy import copy
 from time import sleep
 
@@ -18,8 +19,11 @@ from methodtools import lru_cache
 logging.basicConfig(format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s', datefmt='%H:%M:%S',
                     level=logging.ERROR)
 
+@click.group()
+def cli():
+    pass
 
-@click.command()
+@cli.command()
 @click.option('--output_file_name', default='export.csv', help='All the downloaded trades go here.')
 @click.option('--date_from', default=None, help='Date from')
 @click.option('--date_to', default=datetime.date.today().strftime("%Y-%m-%d"), help='Date to')
@@ -71,9 +75,9 @@ class pricefetchingcache:
     def __init__(self):
         self.exchange = ccxt.binance()
 
-    @lru_cache(max_size=500)
-    def _get_taxprice(self, symbol, minutes):
-        return self.exchange.fetch_ohlcv(symbol, '1m', t, 1)[1]
+    @lru_cache(maxsize=500)
+    def _get_taxprice(self, symbol, minutes_timestamp):
+        return self.exchange.fetch_ohlcv(symbol, timeframe='1m', since=minutes_timestamp, limit=1)[0][1]  # val at the beginning, we use it for taxes so it does not matter as far as it is consistent
         """
                 Which will return candlestick values for one candle
         [ 
@@ -87,7 +91,7 @@ class pricefetchingcache:
         """
 
     def get_taxprice(self, symbol, timestamp, known={}):
-        t = int(timestamp * 1000)
+        assert isinstance(timestamp, int)
         splits = symbol.split("/")
         if splits[0] == splits[1]:
             return 1
@@ -95,18 +99,18 @@ class pricefetchingcache:
         if symbol in known:
             return known[symbol]
 
-        return self._get_taxprice(symbol, t)
+        return self._get_taxprice(symbol, timestamp)
 
 
 def ccxt_fmt_to_accounting_fmt(exchange_name, item, pricefetching=pricefetchingcache()):
-    if item['type'] == "buy":
+    if item['side'] == "buy":
         firstsign = +1
         secondsign = -1
     else:
         firstsign = -1
-        secondsign = -1
+        secondsign = +1
 
-    changes = list(item['symbol'].split("/")) + item['fee']['currency']
+    changes = list(item['symbol'].split("/")) + [item['fee']['currency']]  # first comodity that changed, second, third (the fee)
     amounts = [firstsign * item['amount'], secondsign * item['cost'], -item['fee']['cost']]
 
     # now add prices:
@@ -158,21 +162,21 @@ ACCOUNTINGFMT = ("exchange", "datetime",
                  "PriceFee", "proxy/final"
                  )
 
+class PythonLiteralOption(click.Option):
 
-def taxing_price_info(item, proxy="USDT", curr="EUR", curr_symbol="EUR/USDT"):
-    # curr1/USDT price, curr2/USDT price, curr3/USDT price, EUR/USDT price
-    prices = []
+    def type_cast_value(self, ctx, value):
+        try:
+            return ast.literal_eval(value)
+        except:
+            raise click.BadParameter(value)
 
-    traded = list(item['symbol'].split("/"))
-    if traded[1] == "USDT":
-
-
-@click.command(name="continuousdl")
+@cli.command(name="continuousdl")
 @click.option('--output_file_dir', default='./export', help='All the downloaded trades go here.')
 @click.option('--min_date_from', default=None, help='Limiting date from (never go beyond this)')
 @click.option('--date_to', default=datetime.date.today().strftime("%Y-%m-%d"), help='Date to')
 @click.option('--exch_config', default='exchanges_private.py', help='Exchange private settings and keys')
-def continuousdl(output_file_dir, min_date_from, date_to, exch_config):
+@click.option('--filter_markets', default=None, cls=PythonLiteralOption, help='Only select trades on these markets')
+def continuousdl(output_file_dir, min_date_from, date_to, exch_config, filter_markets):
     """
     Download everything from the last successfull download up to YESTERDAY data
     (and maybe something today also, but do not count on it)
@@ -225,24 +229,27 @@ def continuousdl(output_file_dir, min_date_from, date_to, exch_config):
     print('Date range from {} to {}'.format(min_date_from, date_to.strftime(DATA_FORMAT_HERE)))
 
     date_last_valid_yesterday = (datetime.date.today() - datetime.timedelta(days=1)).strftime(DATA_FORMAT_HERE)
-    file_to_produce = os.path.join(output_file_dir, fname_def + date_last_valid_yesterday + fname_end)
-    print(f"producing to {file_to_produce}")
+    file_temp = os.path.join(output_file_dir, "temp" + date_last_valid_yesterday + ".tmp")
+    file_final = os.path.join(output_file_dir, fname_def + date_last_valid_yesterday + fname_end)
+    print(f"producing to {file_temp} (yesterdays date as that data will be full, today might not)")
 
     pricefetching = pricefetchingcache()
 
-    with open(file_to_produce, 'w', encoding='UTF8', newline='') as f:
+    with open(file_temp, 'w', encoding='UTF8', newline='') as f:
         writer = csv.writer(f, delimiter=';')
         writer.writerow(ACCOUNTINGFMT)
 
         for exchange in exchanges:
             print()
             print(exchange.name)
-            all_my_trades = get_exch_trades(date_from, date_to, exchange)
+            all_my_trades = get_exch_trades(date_from, date_to, exchange, filter_markets=filter_markets)
 
             for trade in all_my_trades:
-                writer.writerow(ccxt_fmt_to_accounting_fmt(exchange.name, trade, pricefetching)
+                writer.writerow(ccxt_fmt_to_accounting_fmt(exchange.name, trade, pricefetching))
 
-                print('\nDone, see {}'.format(file_to_produce))
+    os.rename(file_temp, file_final)
+
+    print('\nDone, see {}'.format(file_final))
 
                 # TODO: merge vsech techto,
                 # Stvoreni dane metodou FIFO
@@ -252,26 +259,33 @@ def continuousdl(output_file_dir, min_date_from, date_to, exch_config):
                 # https://stackoverflow.com/questions/70318352/how-to-get-the-price-of-a-crypto-at-a-given-time-in-the-past
 
 
-def get_exch_trades(date_from, date_to, exchange, add_ref_price="EUR", filter_currencies=None):
-    filter_currencies = set(filter_currencies) if filter_currencies else None
-    if exchange.name.find('Coinbase') >= 0 or exchange.name.find('Binance') >= 0 or exchange.name.find('Huobi') >= 0:
-        markets = exchange.load_markets()
-
-        if exchange.name.find('Binance') >= 0:
-            markets = [m for m in markets if m.find(":") < 0]
-
-        if filter_currencies:
-            symbols = [symbol for symbol in markets if not set(symbol.split("/")).isdisjoint(filter_currencies)]
-        else:
-            symbols = [symbol for symbol in markets]
+def get_exch_trades(date_from, date_to, exchange, add_ref_price="EUR", filter_currencies=None, filter_markets=None):
+    if exchange.markets is None:
+        exchange.load_markets()
+    if filter_markets:
+        symbols = filter_markets
+        if exchange.markets is not None:
+            symbols = [symbol for symbol in symbols if symbol in exchange.markets]
     else:
-        symbols = [None]
+        filter_currencies = set(filter_currencies) if filter_currencies else None
+        if exchange.name.find('Coinbase') >= 0 or exchange.name.find('Binance') >= 0 or exchange.name.find('Huobi') >= 0:
+            markets = exchange.load_markets()
+
+            if exchange.name.find('Binance') >= 0:
+                markets = [m for m in markets if m.find(":") < 0]
+
+            if filter_currencies:
+                symbols = [symbol for symbol in markets if not set(symbol.split("/")).isdisjoint(filter_currencies)]
+            else:
+                symbols = [symbol for symbol in markets]
+        else:
+            symbols = [None]
 
     # exchange.verbose = True
 
     # date_from_ = int(date_from.timestamp()) * 1000 if date_from else None
     # date_to_ = int(date_to.timestamp() + 24 * 60 * 60) * 1000
-    date_from_ = exchange.parse8601(date_from.isoformat())
+    date_from_ = exchange.parse8601(date_from.isoformat()) if date_from else None
     date_to_ = exchange.parse8601(date_to.isoformat())
 
     params = {}
@@ -299,6 +313,5 @@ def get_exch_trades(date_from, date_to, exchange, add_ref_price="EUR", filter_cu
             if trade['timestamp'] < date_to_ and
             (not filter_currencies or not set(trade['symbol'].split("/")).isdisjoint(filter_currencies))]
 
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    cli()

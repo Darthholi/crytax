@@ -1,1 +1,2 @@
 ccxt==1.59.72
+methodtools
