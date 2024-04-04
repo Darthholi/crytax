@@ -212,7 +212,7 @@ def continuousdl(output_file_dir, min_date_from, date_to, exch_config, filter_ma
     if not os.path.exists(output_file_dir):
         os.makedirs(output_file_dir)
 
-    existing_files = [f for f in os.listdir(output_file_dir) if os.path.isfile(f)]
+    existing_files = [f for f in os.listdir(output_file_dir) if os.path.isfile(os.path.join(output_file_dir, f))]
     match = fname_def + "((19|20)\d{2})-(0[1-9]|1[1,2])-(0[1-9]|[12][0-9]|3[01])" + fname_end
     files_produced_valid = [fn for fn in existing_files if re.match(match, os.path.basename(fn))]
     parsed_dates = []
@@ -224,11 +224,11 @@ def continuousdl(output_file_dir, min_date_from, date_to, exch_config, filter_ma
     if parsed_dates:
         latest_valid_day = max(parsed_dates)
         print(f"Found latest valid data for {latest_valid_day}")
-        date_from = max(min_date_from, latest_valid_day)
+        date_from = max([x for x in [min_date_from, latest_valid_day] if x is not None])
     else:
         date_from = min_date_from
 
-    print('Date range from {} to {}'.format(min_date_from, date_to.strftime(DATA_FORMAT_HERE)))
+    print('Date range from {} to {}'.format(date_from, date_to.strftime(DATA_FORMAT_HERE)))
 
     date_last_valid_yesterday = (datetime.date.today() - datetime.timedelta(days=1)).strftime(DATA_FORMAT_HERE)
     file_temp = os.path.join(output_file_dir, "temp" + date_last_valid_yesterday + ".tmp")
@@ -287,8 +287,8 @@ def get_exch_trades(date_from, date_to, exchange, add_ref_price="EUR", filter_cu
 
     # date_from_ = int(date_from.timestamp()) * 1000 if date_from else None
     # date_to_ = int(date_to.timestamp() + 24 * 60 * 60) * 1000
-    date_from_ = exchange.parse8601(date_from.isoformat()) if date_from else None
-    date_to_ = exchange.parse8601(date_to.isoformat())
+    date_from_ = exchange.parse8601(datetime.datetime.combine(date_from,datetime.time()).isoformat()) if date_from else None
+    date_to_ = exchange.parse8601(datetime.datetime.combine(date_to,datetime.time()).isoformat())
 
     params = {}
     exchange.checkRequiredCredentials()  # raises AuthenticationError
