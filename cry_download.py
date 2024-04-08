@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import ast
+import ccxt
 from copy import copy
 from time import sleep
 
@@ -74,10 +75,17 @@ def main(output_file_name, date_from, date_to, exch_config, filter_fiats):
 class pricefetchingcache:
     def __init__(self):
         self.exchange = ccxt.binance()
+        self.exchange.load_markets()
 
     @lru_cache(maxsize=500)
     def _get_taxprice(self, symbol, minutes_timestamp):
-        return self.exchange.fetch_ohlcv(symbol, timeframe='1m', since=minutes_timestamp, limit=1)[0][1]  # val at the beginning, we use it for taxes so it does not matter as far as it is consistent
+
+        if symbol in self.exchange.symbols:
+            return self.exchange.fetch_ohlcv(symbol, timeframe='1m', since=minutes_timestamp, limit=1)[0][1]
+        else:
+            symbol = "/".join(symbol.split("/")[::-1])
+
+            return 1.0 / self.exchange.fetch_ohlcv(symbol, timeframe='1m', since=minutes_timestamp, limit=1)[0][1]  # val at the beginning, we use it for taxes so it does not matter as far as it is consistent
         """
                 Which will return candlestick values for one candle
         [ 
@@ -102,6 +110,9 @@ class pricefetchingcache:
         return self._get_taxprice(symbol, timestamp)
 
 
+CPROXY = "USDT"
+CFINAL = "EUR"
+
 def ccxt_fmt_to_accounting_fmt(exchange_name, item, pricefetching=pricefetchingcache()):
     if item['side'] == "buy":
         firstsign = +1
@@ -115,31 +126,32 @@ def ccxt_fmt_to_accounting_fmt(exchange_name, item, pricefetching=pricefetchingc
 
     # now add prices:
     # curr1/USDT price, curr2/USDT price, curr3/USDT price, EUR/USDT price
-    pricesproxy_info = "USDT-EUR"  # proxy-final
-    feeproxyinfo = "USDT-EUR"  # proxy-final
+    # pricesproxy_info = "USDT"  # proxy
+    # feeproxyinfo = "USDT"  # proxy
     prices = [1,  # first commodity to proxy (pricesinfo)
               1,  # second commodity to proxy (pricesinfo)
               1,  # fee to proxy (usdt)
               1,  # EUR/USDT (final/proxy)
               ]
 
-    if changes[1] == "EUR":  # we do not need proxy, we traded directly with eur
-        pricesproxy_info = "EUR-EUR"
+    if changes[1] == CFINAL:  # we do not need proxy, we traded directly with eur
+        pricesproxy_info = CFINAL
         prices[0] = item["price"]
         prices[1] = 1
     else:
-        prices[0] = pricefetching.get_taxprice(changes[0] + '/USDT', item['timestamp'], {item['symbol']: item["price"]})
-        prices[1] = pricefetching.get_taxprice(changes[1] + '/USDT', item['timestamp'], {item['symbol']: item["price"]})
+        pricesproxy_info = CPROXY
+        prices[0] = pricefetching.get_taxprice(changes[0] + '/' + CPROXY, item['timestamp'], {item['symbol']: item["price"]})
+        prices[1] = pricefetching.get_taxprice(changes[1] + '/' + CPROXY, item['timestamp'], {item['symbol']: item["price"]})
 
     # now fee value
-    if changes[2] == "EUR":  # fee was paid in euro, no proxy needed
-        feeproxyinfo = "EUR-EUR"
+    if changes[2] == CFINAL:  # fee was paid in euro, no proxy needed
+        feeproxyinfo = CFINAL
         prices[2] = 1
-        prices[3] = 1
     else:  # we go through proxy
-        prices[2] = pricefetching.get_taxprice(changes[2] + '/USDT', item['timestamp'], {item['symbol']: item["price"]})
-        prices[3] = 1.0 / pricefetching.get_taxprice('EUR/USDT', item['timestamp'], {item['symbol']: item["price"]})
-        # if that would be usdt/eur we do not need to do 1.0/
+        feeproxyinfo = CPROXY  # proxy
+        prices[2] = pricefetching.get_taxprice(changes[2] + '/' + CPROXY, item['timestamp'], {item['symbol']: item["price"]})
+
+    prices[3] = pricefetching.get_taxprice(CFINAL + '/' + CPROXY, item['timestamp'], {item['symbol']: item["price"]})
 
     return (exchange_name, item['datetime'],
             changes[0], amounts[0],  # we did this change in this currency of this amount
@@ -148,7 +160,7 @@ def ccxt_fmt_to_accounting_fmt(exchange_name, item, pricefetching=pricefetchingc
             pricesproxy_info,  # FOr taxing, we use proxy-final (or there can be written final-final without proxy)
             prices[0], prices[1],  # these are the prices (open) of the first and second currency
             feeproxyinfo,  # For taxing the fee , we use proxy-final (or there can be written final-final without proxy)
-            prices[2], prices[3]  # price for fee/proxy, price proxy/final (usually usdt/eur)
+            prices[2], prices[3]  # price for fee/proxy, price proxy/final (usually eur/usdt)
             )
 
 
@@ -159,7 +171,7 @@ ACCOUNTINGFMT = ("exchange", "datetime",
                  "TaxProxy",
                  "PriceA", "PriceB",
                  "FeeProxy",
-                 "PriceFee", "proxy/final"
+                 "PriceFee", "proxy("+CFINAL+")/final("+CPROXY+")"
                  )
 
 class PythonLiteralOption(click.Option):
@@ -253,15 +265,8 @@ def continuousdl(output_file_dir, min_date_from, date_to, exch_config, filter_ma
 
     print('\nDone, see {}'.format(file_final))
 
-                # TODO: merge vsech techto,
-                # Stvoreni dane metodou FIFO
-                # todo - vcetne daneni v okamziku smeny za jinou kryptomenu, takze je potreba znat cenu v okamziku obchodu
-                # (asi prez btc cenu? nebo jakoukoliv jinou)
-                # kdyz se nenajde v ucetni knize, brat jako ze vznikla odjinud a danit bez nakupni ceny.
-                # https://stackoverflow.com/questions/70318352/how-to-get-the-price-of-a-crypto-at-a-given-time-in-the-past
 
-
-def get_exch_trades(date_from, date_to, exchange, add_ref_price="EUR", filter_currencies=None, filter_markets=None):
+def get_exch_trades(date_from, date_to, exchange, filter_currencies=None, filter_markets=None):
     if exchange.markets is None:
         exchange.load_markets()
     if filter_markets:

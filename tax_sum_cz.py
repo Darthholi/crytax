@@ -7,12 +7,11 @@ import logging
 import os
 import re
 import ast
-import defaultdict
+from collections import defaultdict
 from copy import copy
 from time import sleep
 import pandas as pd
 
-import ccxt.base.errors
 import click
 import tqdm
 from currencies import MONEY_FORMATS
@@ -31,6 +30,14 @@ logging.basicConfig(format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(messa
 @click.option('--date_to', default=datetime.date.today().strftime("%Y-%m-%d"), help='Date to')
 def main(transact_file_dir, date_from, date_to):
     """
+
+
+     # TODO: merge vsech techto,
+                # Stvoreni dane metodou FIFO
+                # todo - vcetne daneni v okamziku smeny za jinou kryptomenu, takze je potreba znat cenu v okamziku obchodu
+                # (asi prez btc cenu? nebo jakoukoliv jinou)
+                # kdyz se nenajde v ucetni knize, brat jako ze vznikla odjinud a danit bez nakupni ceny.
+                # https://stackoverflow.com/questions/70318352/how-to-get-the-price-of-a-crypto-at-a-given-time-in-the-past
     """
     DATA_FORMAT_HERE = '%Y-%m-%d'
     fname_def = "export"
@@ -63,58 +70,63 @@ def main(transact_file_dir, date_from, date_to):
     print('Date range from {} to {}'.format(date_from, date_to.strftime(DATA_FORMAT_HERE)))
 
     #debug first level
-    load = os.path.join(transact_file_dir, existing_files[0])
+    load = os.path.join(transact_file_dir, files_produced_valid[0])
 
-    df = pd.read_csv(load)
+    df = pd.read_csv(load, sep=";")
 
     portfolio = defaultdict(lambda: {"amount": 0.0, "avprice": 0.0})  # method of averages!
 
-    for row in df.iterrows():  # debug, maybe faster next time!
-
+    for id, row in df.iterrows():  # debug, maybe faster next time!
 
         change = row["ChngA"]
         currency = row["CurrA"]
+        pricenow = row["PriceA"]
+        if row["TaxProxy"] == "USDT":  # was in usdt, we want it in eur
+            pricenow *= row["proxy(USDT)/final(EUR)"]
+        portfolio[currency] = procrow(change, currency, pricenow, portfolio[currency])
 
-        if change > 0: # nothing to tax, we just update since we buy!
-            oldamount = portfolio[currency]["amount"]
-            oldprice = portfolio[currency]["avprice"]
-            portfolio[currency]["amount"] += change
+        change = row["ChngB"]
+        currency = row["CurrB"]
+        pricenow = row["PriceB"]
+        if row["TaxProxy"] == "USDT":
+            pricenow *= row["proxy(USDT)/final(EUR)"]
+        portfolio[currency] = procrow(change, currency, pricenow, portfolio[currency])
 
-            pricenow = 0
+        change = row["ChngFee"]
+        currency = row["CurrFee"]
+        pricenow = row["PriceFee"]
+        if row["FeeProxy"] == "USDT":
+            pricenow *= row["proxy(USDT)/final(EUR)"]
+        portfolio[currency] = procrow(change, currency, pricenow, portfolio[currency])  # todo mark this as not profit, but cost
 
-            portfolio[currency]["avprice"] = (pricenow * change + oldprice * oldamount) / portfolio[currency]["amount"]
-        else:
-            existing_part = min(portfolio[currency]["amount"], -change)
-            if existing_part > 0:
+        
+def procrow(change, currency, pricenow, state):
+    if change > 0:  # nothing to tax, we just update since we buy!
+        oldamount = state["amount"]
+        oldprice = state["avprice"]
+        state["amount"] += change
+        state["avprice"] = (pricenow * change + oldprice * oldamount) / state["amount"]
+    else:  # we sell stuff
+        existing_part = min(state["amount"], -change)
+        if existing_part > 0:  # can we sell something?
 
+            state["amount"] -= existing_part
+            print(f"Selling {currency} was at {state['avprice']} -> {pricenow}")
 
+            if existing_part >= state["amount"] or state["amount"] <= 0:
+                # we sold everything we have, lets just reset it
+                state["amount"] = 0.0
+                state["avprice"] = 0.0
 
+        change = change + existing_part  # negative + positive, we make the number smaller
+        # now we sell stuff that seems we do not have bought in the first place
+        # it measns we do not have the data for that or we have received it through some random means (gifts)
+        # and that needs to be taxed!
 
-
-
-
-    with open(file_temp, 'w', encoding='UTF8', newline='') as f:
-        writer = csv.writer(f, delimiter=';')
-        writer.writerow(ACCOUNTINGFMT)
-
-        for exchange in exchanges:
-            print()
-            print(exchange.name)
-            all_my_trades = get_exch_trades(date_from, date_to, exchange, filter_markets=filter_markets)
-
-            for trade in all_my_trades:
-                writer.writerow(ccxt_fmt_to_accounting_fmt(exchange.name, trade, pricefetching))
-
-    os.rename(file_temp, file_final)
-
-    print('\nDone, see {}'.format(file_final))
-
-                # TODO: merge vsech techto,
-                # Stvoreni dane metodou FIFO
-                # todo - vcetne daneni v okamziku smeny za jinou kryptomenu, takze je potreba znat cenu v okamziku obchodu
-                # (asi prez btc cenu? nebo jakoukoliv jinou)
-                # kdyz se nenajde v ucetni knize, brat jako ze vznikla odjinud a danit bez nakupni ceny.
-                # https://stackoverflow.com/questions/70318352/how-to-get-the-price-of-a-crypto-at-a-given-time-in-the-past
+        print(f"Was selling {currency} for {-change * pricenow} without a buy price")
+        assert state["avprice"] == 0.0
+        
+        return state
 
 
 if __name__ == '__main__':
