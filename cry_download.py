@@ -171,7 +171,7 @@ ACCOUNTINGFMT = ("exchange", "datetime",
                  "TaxProxy",
                  "PriceA", "PriceB",
                  "FeeProxy",
-                 "PriceFee", "proxy("+CFINAL+")/final("+CPROXY+")"
+                 "PriceFee", "final("+CFINAL+")/proxy("+CPROXY+")"
                  )
 
 class PythonLiteralOption(click.Option):

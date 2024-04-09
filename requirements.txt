@@ -3,3 +3,4 @@ methodtools
 click
 tqdm
 currencies
+pandas

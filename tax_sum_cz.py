@@ -1,28 +1,16 @@
 # -*- coding: utf-8 -*-
 
-import csv
 import datetime
-import importlib
 import logging
 import os
 import re
-import ast
 from collections import defaultdict
-from copy import copy
-from time import sleep
 import pandas as pd
 
 import click
-import tqdm
-from currencies import MONEY_FORMATS
-from methodtools import lru_cache
 
 logging.basicConfig(format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s', datefmt='%H:%M:%S',
                     level=logging.ERROR)
-
-#@click.group()
-#def cli():
-#    pass
 
 @click.command()
 @click.option('--transact_file_dir', default='./export', help='All the downloaded trades go here.')
@@ -82,21 +70,21 @@ def main(transact_file_dir, date_from, date_to):
         currency = row["CurrA"]
         pricenow = row["PriceA"]
         if row["TaxProxy"] == "USDT":  # was in usdt, we want it in eur
-            pricenow *= row["proxy(USDT)/final(EUR)"]
+            pricenow *= row["final(EUR)/proxy(USDT)"]
         portfolio[currency] = procrow(change, currency, pricenow, portfolio[currency])
 
         change = row["ChngB"]
         currency = row["CurrB"]
         pricenow = row["PriceB"]
         if row["TaxProxy"] == "USDT":
-            pricenow *= row["proxy(USDT)/final(EUR)"]
+            pricenow *= row["final(EUR)/proxy(USDT)"]
         portfolio[currency] = procrow(change, currency, pricenow, portfolio[currency])
 
         change = row["ChngFee"]
         currency = row["CurrFee"]
         pricenow = row["PriceFee"]
         if row["FeeProxy"] == "USDT":
-            pricenow *= row["proxy(USDT)/final(EUR)"]
+            pricenow *= row["final(EUR)/proxy(USDT)"]
         portfolio[currency] = procrow(change, currency, pricenow, portfolio[currency])  # todo mark this as not profit, but cost
 
         
