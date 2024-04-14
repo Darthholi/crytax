@@ -8,73 +8,19 @@ import os
 import re
 import ast
 import ccxt
-from copy import copy
 from time import sleep
 
 import ccxt.base.errors
 import click
 import tqdm
-from currencies import MONEY_FORMATS
 from methodtools import lru_cache
 
 logging.basicConfig(format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s', datefmt='%H:%M:%S',
                     level=logging.ERROR)
 
-@click.group()
-def cli():
-    pass
-
-@cli.command()
-@click.option('--output_file_name', default='export.csv', help='All the downloaded trades go here.')
-@click.option('--date_from', default=None, help='Date from')
-@click.option('--date_to', default=datetime.date.today().strftime("%Y-%m-%d"), help='Date to')
-@click.option('--exch_config', default='exchanges_private.py', help='Exchange private settings and keys')
-@click.option('--filter_fiats', default=False, help='Filter only conversions to fiats')
-def main(output_file_name, date_from, date_to, exch_config, filter_fiats):
-    if filter_fiats:
-        defformats = copy(MONEY_FORMATS)
-        del defformats["BHD"]  # BHD is some bhutan dollar but also BtcHD so lets filter it out for the default
-        fiats = list(defformats)
-    else:
-        fiats = None
-
-    if date_from == "None":
-        date_from = None
-
-    if not os.path.exists(exch_config):
-        print('Exchanges file {} not exists. '
-              'Rename exchanges_example.py to exchanges_private.py and fill credentials.'.format(exch_config))
-        return
-
-    date_from = datetime.datetime.strptime(date_from, '%Y-%m-%d') if date_from else None
-    date_to = datetime.datetime.strptime(date_to, '%Y-%m-%d')
-    print('Date range from {} to {}'.format(date_from, date_to.strftime('%Y-%m-%d')))
-    # huobi https://github.com/ccxt/ccxt/issues/6512
-
-    exch_config = (os.path.splitext(exch_config)[0])
-    exchangesModule = importlib.import_module(exch_config)
-    exchanges = exchangesModule.exchanges
-
-    header = ['exchange', 'datetime', 'symbol', 'cost', 'amount', 'side']
-    with open(output_file_name, 'w', encoding='UTF8', newline='') as f:
-        writer = csv.writer(f, delimiter=';')
-        writer.writerow(header)
-
-        for exchange in exchanges:
-            print()
-            print(exchange.name)
-            all_my_trades = get_exch_trades(date_from, date_to, exchange, fiats)
-
-            for trade in all_my_trades:
-                writer.writerow([exchange.name] +
-                                [trade[item] for item in ['datetime', 'symbol', 'cost', 'amount', 'side']])
-
-    print('\nDone, see {}'.format(output_file_name))
-
-
 class pricefetchingcache:
     def __init__(self):
-        self.exchange = ccxt.binance()
+        self.exchange = ccxt.binance({ 'options': { 'adjustForTimeDifference': True }})
         self.exchange.load_markets()
 
     @lru_cache(maxsize=500)
@@ -184,13 +130,13 @@ class PythonLiteralOption(click.Option):
         except:
             raise click.BadParameter(value)
 
-@cli.command(name="continuousdl")
+@click.command()
 @click.option('--output_file_dir', default='./export', help='All the downloaded trades go here.')
 @click.option('--min_date_from', default=None, help='Limiting date from (never go beyond this)')
 @click.option('--date_to', default=datetime.date.today().strftime("%Y-%m-%d"), help='Date to')
 @click.option('--exch_config', default='exchanges_private.py', help='Exchange private settings and keys')
 @click.option('--filter_markets', default=None, cls=PythonLiteralOption, help='Only select trades on these markets')
-def continuousdl(output_file_dir, min_date_from, date_to, exch_config, filter_markets):
+def main(output_file_dir, min_date_from, date_to, exch_config, filter_markets):
     """
     Download everything from the last successfull download up to YESTERDAY data
     (and maybe something today also, but do not count on it)
@@ -321,4 +267,4 @@ def get_exch_trades(date_from, date_to, exchange, filter_currencies=None, filter
             (not filter_currencies or not set(trade['symbol'].split("/")).isdisjoint(filter_currencies))]
 
 if __name__ == '__main__':
-    cli()
+    main()

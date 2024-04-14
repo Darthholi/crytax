@@ -1,4 +1,4 @@
-ccxt
+ccxt==3.0.9
 methodtools
 click
 tqdm
