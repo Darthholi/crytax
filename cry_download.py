@@ -159,7 +159,7 @@ def main(output_file_dir, min_date_from, date_to, exch_config, filter_markets):
               'Rename exchanges_example.py to exchanges_private.py and fill credentials.'.format(exch_config))
         return
 
-    min_date_from = datetime.datetime.strptime(min_date_from, DATA_FORMAT_HERE) if min_date_from else None
+    min_date_from = datetime.datetime.strptime(min_date_from, DATA_FORMAT_HERE).date() if min_date_from else None
     date_to = datetime.datetime.strptime(date_to, DATA_FORMAT_HERE)
     # huobi https://github.com/ccxt/ccxt/issues/6512
 
