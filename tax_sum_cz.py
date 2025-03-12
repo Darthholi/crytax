@@ -13,7 +13,8 @@ logging.basicConfig(format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(messa
                     level=logging.ERROR)
 
 @click.command()
-@click.option('--transact_file_dir', default='./export', help='All the downloaded trades go here.')
+@click.option('--transact_file_dir', default='/media/martin/DATA/Data/crypto_tax_exports/', #default='./export',
+ help='All the downloaded trades go here.')
 @click.option('--date_from', default=None, help='Limiting date from (never go beyond this)')
 @click.option('--date_to', default=datetime.date.today().strftime("%Y-%m-%d"), help='Date to')
 def main(transact_file_dir, date_from, date_to):
@@ -63,6 +64,7 @@ def main(transact_file_dir, date_from, date_to):
     df = pd.read_csv(load, sep=";")
 
     portfolio = defaultdict(lambda: {"amount": 0.0, "avprice": 0.0})  # method of averages!
+    gainstotax = 0
 
     for id, row in df.iterrows():  # debug, maybe faster next time!
 
@@ -71,24 +73,35 @@ def main(transact_file_dir, date_from, date_to):
         pricenow = row["PriceA"]
         if row["TaxProxy"] == "USDT":  # was in usdt, we want it in eur
             pricenow *= row["final(EUR)/proxy(USDT)"]
-        portfolio[currency] = procrow(change, currency, pricenow, portfolio[currency])
+        taxdelta, portfolio[currency] = procrow(change, currency, pricenow, portfolio[currency])
+        gainstotax += taxdelta
 
         change = row["ChngB"]
         currency = row["CurrB"]
         pricenow = row["PriceB"]
         if row["TaxProxy"] == "USDT":
             pricenow *= row["final(EUR)/proxy(USDT)"]
-        portfolio[currency] = procrow(change, currency, pricenow, portfolio[currency])
+        taxdelta, portfolio[currency] = procrow(change, currency, pricenow, portfolio[currency])
+        gainstotax += taxdelta
+
 
         change = row["ChngFee"]
         currency = row["CurrFee"]
         pricenow = row["PriceFee"]
         if row["FeeProxy"] == "USDT":
             pricenow *= row["final(EUR)/proxy(USDT)"]
-        portfolio[currency] = procrow(change, currency, pricenow, portfolio[currency])  # todo mark this as not profit, but cost
+        taxdelta, portfolio[currency] = procrow(change, currency, pricenow, portfolio[currency], True)  # todo mark this as not profit, but cost
+        gainstotax += taxdelta
+
+
+    print("final comouted portfolio")
+    print(portfolio)
+    print("gains to tax")
+    print(gainstotax)
 
         
-def procrow(change, currency, pricenow, state):
+def procrow(change, currency, pricenow, state, taxascost=False):
+    taxdelta = 0
     if change > 0:  # nothing to tax, we just update since we buy!
         oldamount = state["amount"]
         oldprice = state["avprice"]
@@ -99,7 +112,8 @@ def procrow(change, currency, pricenow, state):
         if existing_part > 0:  # can we sell something?
 
             state["amount"] -= existing_part
-            print(f"Selling {currency} was at {state['avprice']} -> {pricenow}")
+            taxdelta = existing_part * (pricenow - state['avprice'])
+            print(f"Selling {currency} was at {state['avprice']} -> {pricenow}, taxing {taxdelta}")
 
             if existing_part >= state["amount"] or state["amount"] <= 0:
                 # we sold everything we have, lets just reset it
@@ -111,10 +125,14 @@ def procrow(change, currency, pricenow, state):
         # it measns we do not have the data for that or we have received it through some random means (gifts)
         # and that needs to be taxed!
 
-        print(f"Was selling {currency} for {-change * pricenow} without a buy price")
-        assert state["avprice"] == 0.0
-        
-        return state
+        if abs(change) > 0:
+            print(f"Was selling {currency} for {-change * pricenow} without a recorded buy price, taxing as a full gain")
+            taxdelta = -change * pricenow
+            assert state["avprice"] == 0.0
+
+    if taxascost:
+        taxdelta = -abs(taxdelta)
+    return taxdelta, state
 
 
 if __name__ == '__main__':

@@ -1,6 +1,5 @@
-ccxt==3.0.9
+ccxt
 methodtools
 click
 tqdm
 currencies
-pandas

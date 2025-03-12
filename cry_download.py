@@ -7,31 +7,77 @@ import logging
 import os
 import re
 import ast
-import ccxt
+from copy import copy
 from time import sleep
 
 import ccxt.base.errors
 import click
 import tqdm
+from currencies import MONEY_FORMATS
 from methodtools import lru_cache
 
 logging.basicConfig(format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s', datefmt='%H:%M:%S',
                     level=logging.ERROR)
 
+@click.group()
+def cli():
+    pass
+
+@cli.command()
+@click.option('--output_file_name', default='export.csv', help='All the downloaded trades go here.')
+@click.option('--date_from', default=None, help='Date from')
+@click.option('--date_to', default=datetime.date.today().strftime("%Y-%m-%d"), help='Date to')
+@click.option('--exch_config', default='exchanges_private.py', help='Exchange private settings and keys')
+@click.option('--filter_fiats', default=False, help='Filter only conversions to fiats')
+def main(output_file_name, date_from, date_to, exch_config, filter_fiats):
+    if filter_fiats:
+        defformats = copy(MONEY_FORMATS)
+        del defformats["BHD"]  # BHD is some bhutan dollar but also BtcHD so lets filter it out for the default
+        fiats = list(defformats)
+    else:
+        fiats = None
+
+    if date_from == "None":
+        date_from = None
+
+    if not os.path.exists(exch_config):
+        print('Exchanges file {} not exists. '
+              'Rename exchanges_example.py to exchanges_private.py and fill credentials.'.format(exch_config))
+        return
+
+    date_from = datetime.datetime.strptime(date_from, '%Y-%m-%d') if date_from else None
+    date_to = datetime.datetime.strptime(date_to, '%Y-%m-%d')
+    print('Date range from {} to {}'.format(date_from, date_to.strftime('%Y-%m-%d')))
+    # huobi https://github.com/ccxt/ccxt/issues/6512
+
+    exch_config = (os.path.splitext(exch_config)[0])
+    exchangesModule = importlib.import_module(exch_config)
+    exchanges = exchangesModule.exchanges
+
+    header = ['exchange', 'datetime', 'symbol', 'cost', 'amount', 'side']
+    with open(output_file_name, 'w', encoding='UTF8', newline='') as f:
+        writer = csv.writer(f, delimiter=';')
+        writer.writerow(header)
+
+        for exchange in exchanges:
+            print()
+            print(exchange.name)
+            all_my_trades = get_exch_trades(date_from, date_to, exchange, fiats)
+
+            for trade in all_my_trades:
+                writer.writerow([exchange.name] +
+                                [trade[item] for item in ['datetime', 'symbol', 'cost', 'amount', 'side']])
+
+    print('\nDone, see {}'.format(output_file_name))
+
+
 class pricefetchingcache:
     def __init__(self):
-        self.exchange = ccxt.binance({ 'options': { 'adjustForTimeDifference': True }})
-        self.exchange.load_markets()
+        self.exchange = ccxt.binance()
 
     @lru_cache(maxsize=500)
     def _get_taxprice(self, symbol, minutes_timestamp):
-
-        if symbol in self.exchange.symbols:
-            return self.exchange.fetch_ohlcv(symbol, timeframe='1m', since=minutes_timestamp, limit=1)[0][1]
-        else:
-            symbol = "/".join(symbol.split("/")[::-1])
-
-            return 1.0 / self.exchange.fetch_ohlcv(symbol, timeframe='1m', since=minutes_timestamp, limit=1)[0][1]  # val at the beginning, we use it for taxes so it does not matter as far as it is consistent
+        return self.exchange.fetch_ohlcv(symbol, timeframe='1m', since=minutes_timestamp, limit=1)[0][1]  # val at the beginning, we use it for taxes so it does not matter as far as it is consistent
         """
                 Which will return candlestick values for one candle
         [ 
@@ -56,9 +102,6 @@ class pricefetchingcache:
         return self._get_taxprice(symbol, timestamp)
 
 
-CPROXY = "USDT"
-CFINAL = "EUR"
-
 def ccxt_fmt_to_accounting_fmt(exchange_name, item, pricefetching=pricefetchingcache()):
     if item['side'] == "buy":
         firstsign = +1
@@ -72,32 +115,31 @@ def ccxt_fmt_to_accounting_fmt(exchange_name, item, pricefetching=pricefetchingc
 
     # now add prices:
     # curr1/USDT price, curr2/USDT price, curr3/USDT price, EUR/USDT price
-    # pricesproxy_info = "USDT"  # proxy
-    # feeproxyinfo = "USDT"  # proxy
+    pricesproxy_info = "USDT-EUR"  # proxy-final
+    feeproxyinfo = "USDT-EUR"  # proxy-final
     prices = [1,  # first commodity to proxy (pricesinfo)
               1,  # second commodity to proxy (pricesinfo)
               1,  # fee to proxy (usdt)
               1,  # EUR/USDT (final/proxy)
               ]
 
-    if changes[1] == CFINAL:  # we do not need proxy, we traded directly with eur
-        pricesproxy_info = CFINAL
+    if changes[1] == "EUR":  # we do not need proxy, we traded directly with eur
+        pricesproxy_info = "EUR-EUR"
         prices[0] = item["price"]
         prices[1] = 1
     else:
-        pricesproxy_info = CPROXY
-        prices[0] = pricefetching.get_taxprice(changes[0] + '/' + CPROXY, item['timestamp'], {item['symbol']: item["price"]})
-        prices[1] = pricefetching.get_taxprice(changes[1] + '/' + CPROXY, item['timestamp'], {item['symbol']: item["price"]})
+        prices[0] = pricefetching.get_taxprice(changes[0] + '/USDT', item['timestamp'], {item['symbol']: item["price"]})
+        prices[1] = pricefetching.get_taxprice(changes[1] + '/USDT', item['timestamp'], {item['symbol']: item["price"]})
 
     # now fee value
-    if changes[2] == CFINAL:  # fee was paid in euro, no proxy needed
-        feeproxyinfo = CFINAL
+    if changes[2] == "EUR":  # fee was paid in euro, no proxy needed
+        feeproxyinfo = "EUR-EUR"
         prices[2] = 1
+        prices[3] = 1
     else:  # we go through proxy
-        feeproxyinfo = CPROXY  # proxy
-        prices[2] = pricefetching.get_taxprice(changes[2] + '/' + CPROXY, item['timestamp'], {item['symbol']: item["price"]})
-
-    prices[3] = pricefetching.get_taxprice(CFINAL + '/' + CPROXY, item['timestamp'], {item['symbol']: item["price"]})
+        prices[2] = pricefetching.get_taxprice(changes[2] + '/USDT', item['timestamp'], {item['symbol']: item["price"]})
+        prices[3] = 1.0 / pricefetching.get_taxprice('EUR/USDT', item['timestamp'], {item['symbol']: item["price"]})
+        # if that would be usdt/eur we do not need to do 1.0/
 
     return (exchange_name, item['datetime'],
             changes[0], amounts[0],  # we did this change in this currency of this amount
@@ -106,7 +148,7 @@ def ccxt_fmt_to_accounting_fmt(exchange_name, item, pricefetching=pricefetchingc
             pricesproxy_info,  # FOr taxing, we use proxy-final (or there can be written final-final without proxy)
             prices[0], prices[1],  # these are the prices (open) of the first and second currency
             feeproxyinfo,  # For taxing the fee , we use proxy-final (or there can be written final-final without proxy)
-            prices[2], prices[3]  # price for fee/proxy, price proxy/final (usually eur/usdt)
+            prices[2], prices[3]  # price for fee/proxy, price proxy/final (usually usdt/eur)
             )
 
 
@@ -117,7 +159,7 @@ ACCOUNTINGFMT = ("exchange", "datetime",
                  "TaxProxy",
                  "PriceA", "PriceB",
                  "FeeProxy",
-                 "PriceFee", "final("+CFINAL+")/proxy("+CPROXY+")"
+                 "PriceFee", "proxy/final"
                  )
 
 class PythonLiteralOption(click.Option):
@@ -130,13 +172,13 @@ class PythonLiteralOption(click.Option):
         except:
             raise click.BadParameter(value)
 
-@click.command()
+@cli.command(name="continuousdl")
 @click.option('--output_file_dir', default='./export', help='All the downloaded trades go here.')
 @click.option('--min_date_from', default=None, help='Limiting date from (never go beyond this)')
 @click.option('--date_to', default=datetime.date.today().strftime("%Y-%m-%d"), help='Date to')
 @click.option('--exch_config', default='exchanges_private.py', help='Exchange private settings and keys')
 @click.option('--filter_markets', default=None, cls=PythonLiteralOption, help='Only select trades on these markets')
-def main(output_file_dir, min_date_from, date_to, exch_config, filter_markets):
+def continuousdl(output_file_dir, min_date_from, date_to, exch_config, filter_markets):
     """
     Download everything from the last successfull download up to YESTERDAY data
     (and maybe something today also, but do not count on it)
@@ -159,7 +201,7 @@ def main(output_file_dir, min_date_from, date_to, exch_config, filter_markets):
               'Rename exchanges_example.py to exchanges_private.py and fill credentials.'.format(exch_config))
         return
 
-    min_date_from = datetime.datetime.strptime(min_date_from, DATA_FORMAT_HERE).date() if min_date_from else None
+    min_date_from = datetime.datetime.strptime(min_date_from, DATA_FORMAT_HERE) if min_date_from else None
     date_to = datetime.datetime.strptime(date_to, DATA_FORMAT_HERE)
     # huobi https://github.com/ccxt/ccxt/issues/6512
 
@@ -211,8 +253,15 @@ def main(output_file_dir, min_date_from, date_to, exch_config, filter_markets):
 
     print('\nDone, see {}'.format(file_final))
 
+                # TODO: merge vsech techto,
+                # Stvoreni dane metodou FIFO
+                # todo - vcetne daneni v okamziku smeny za jinou kryptomenu, takze je potreba znat cenu v okamziku obchodu
+                # (asi prez btc cenu? nebo jakoukoliv jinou)
+                # kdyz se nenajde v ucetni knize, brat jako ze vznikla odjinud a danit bez nakupni ceny.
+                # https://stackoverflow.com/questions/70318352/how-to-get-the-price-of-a-crypto-at-a-given-time-in-the-past
 
-def get_exch_trades(date_from, date_to, exchange, filter_currencies=None, filter_markets=None):
+
+def get_exch_trades(date_from, date_to, exchange, add_ref_price="EUR", filter_currencies=None, filter_markets=None):
     if exchange.markets is None:
         exchange.load_markets()
     if filter_markets:
@@ -267,4 +316,4 @@ def get_exch_trades(date_from, date_to, exchange, filter_currencies=None, filter
             (not filter_currencies or not set(trade['symbol'].split("/")).isdisjoint(filter_currencies))]
 
 if __name__ == '__main__':
-    main()
+    cli()
